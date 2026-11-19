@@ -39,6 +39,8 @@ h2{font-size:24px;line-height:1.1;margin:0 0 12px;font-weight:900}
 .btn.pri{background:var(--blue);color:#fff}
 .btn.on{background:var(--ink);color:var(--bg)}
 .hint{font-size:13px;color:var(--mut)}
+.syin{display:block;width:100%;font:inherit;font-size:16px;padding:12px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--ink);margin-bottom:8px;box-sizing:border-box}
+#syMore{flex-wrap:wrap;justify-content:flex-start}
 /* today */
 .phone{background:#0b0b0c;color:#fff;border-radius:22px;padding:18px 14px;margin-top:14px}
 .phone small{color:#9a9da6}
@@ -111,6 +113,15 @@ nav button.on{color:var(--blue)}
     <h2>Все 64 действия</h2>
     <div class="all" id="all"></div>
     <div class="bar"><span class="hint">Сбросить все правки к исходной версии</span><button class="btn" id="reset">Сбросить</button></div>
+    <h2 style="margin-top:28px">Синхронизация с центром</h2>
+    <p class="hint" id="sySt"></p>
+    <div id="syForm">
+      <input class="syin" id="syUrl" placeholder="https://hub.waree.uz" inputmode="url" autocomplete="off">
+      <input class="syin" id="syKey" placeholder="Ключ устройства hub_…" autocomplete="off" type="password">
+      <button class="btn pri" id="syGo">Подключить</button>
+    </div>
+    <div id="syChoice" style="display:none"><p class="hint" id="syChoiceTxt"></p><div class="bar"><button class="btn" id="syTake">Взять с сервера</button><button class="btn pri" id="syGive">Отправить с телефона</button></div></div>
+    <div class="bar" id="syMore"><button class="btn" id="syNow">Синхронизировать</button><button class="btn" id="syPull">Загрузить с сервера</button><button class="btn" id="syOff">Отключить</button></div>
   </section>
 </main>
 
@@ -142,7 +153,7 @@ const P=[0,1,2,5,8,7,6,3]; // block index -> board position (4 = center)
 const $=id=>document.getElementById(id);
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const load=(k,f)=>{try{const v=localStorage.getItem(k);return v?JSON.parse(v):f}catch(e){return f}};
-const save=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}};
+const save=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}if(window.__syc)window.__syc()};
 const ymd=d=>d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
 
 let S=load('m.data',null)||JSON.parse(JSON.stringify(DEF));
@@ -251,9 +262,94 @@ $('reset').addEventListener('click',()=>{if($('reset').dataset.c){S=JSON.parse(J
 let cur='grid';
 function go(v){cur=v;document.querySelectorAll('.view').forEach(x=>x.classList.toggle('on',x.id==='v-'+v));document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));scrollTo(0,0)}
 $('nav').addEventListener('click',e=>{const b=e.target.closest('button');if(b)go(b.dataset.v)});
+/* синхронизация */
+/* ---------- синхронизация с центром (hub) ---------- */
+function makeSync(cfg){
+  // cfg: {app, store, payload(), apply(data), hasData(), onChange()}
+  const K=cfg.store;
+  const st=()=>{try{return JSON.parse(localStorage.getItem(K))||{}}catch(e){return {}}};
+  const put=o=>{try{localStorage.setItem(K,JSON.stringify(Object.assign(st(),o)))}catch(e){}};
+  const base=()=>(st().url||'https://hub.waree.uz').replace(/\/+$/,'');
+  const on=()=>!!(st().key&&st().enabled);
+  async function req(method,body){
+    const s=st();
+    const ctrl=new AbortController();const tm=setTimeout(()=>ctrl.abort(),15000);
+    try{
+      const r=await fetch(base()+'/api/sync/'+(method==='PING'?'ping':cfg.app),{method:method==='PING'?'GET':method,signal:ctrl.signal,
+        headers:Object.assign({'Authorization':'Bearer '+(s.key||'')},body?{'Content-Type':'application/json'}:{}),body:body?JSON.stringify(body):undefined});
+      let j=null;try{j=await r.json()}catch(e){}
+      if(!r.ok){const e=new Error((j&&j.error)||('Ошибка '+r.status));e.status=r.status;throw e}
+      return j;
+    }catch(e){if(e.name==='AbortError')throw new Error('Сервер не отвечает');if(e instanceof TypeError)throw new Error('Нет связи с сервером');throw e}
+    finally{clearTimeout(tm)}
+  }
+  let timer=null,busy=false;
+  async function push(){
+    if(!on()||busy)return;busy=true;
+    try{await req('PUT',{data:cfg.payload()});put({last:Date.now(),dirty:false,err:''})}
+    catch(e){put({err:e.message,dirty:true});if(e.status===401)put({enabled:false})}
+    finally{busy=false;cfg.onChange()}
+  }
+  return {
+    state:st,
+    changed(){if(!on())return;put({dirty:true});clearTimeout(timer);timer=setTimeout(push,2500)},
+    push,
+    resume(){if(on()&&st().dirty)push()},
+    async connect(url,key){
+      put({url:url||'https://hub.waree.uz',key:key.trim(),enabled:false,err:''});
+      await req('PING');
+      let remote=null;
+      try{remote=await req('GET')}catch(e){if(e.status!==404)throw e}
+      put({enabled:true});
+      return remote; // null — на сервере пусто
+    },
+    async pull(){const r=await req('GET');cfg.apply(r.data);put({last:Date.now(),dirty:false,err:''});return r},
+    disable(){put({enabled:false});cfg.onChange()}
+  };
+}
+
+const SY=makeSync({app:'mandala',store:'m.sync',
+  payload:()=>({S,T,H:load('m.hist',{})}),
+  apply:d=>{if(!d||!d.S)throw new Error('Неверные данные');S=d.S;T=d.T||{date:'',items:[],done:[]};H=d.H||{};
+    try{localStorage.setItem('m.data',JSON.stringify(S));localStorage.setItem('m.today',JSON.stringify(T));localStorage.setItem('m.hist',JSON.stringify(H))}catch(e){}
+    renderAll()},
+  onChange:()=>renderSync()});
+window.__syc=()=>SY.changed();
+function agoTxt(ts){if(!ts)return 'никогда';const m=Math.round((Date.now()-ts)/6e4);return m<1?'только что':m<60?m+' мин назад':m<1440?Math.round(m/60)+' ч назад':Math.round(m/1440)+' дн. назад'}
+function renderSync(){
+  const st=SY.state(),on=!!(st.key&&st.enabled);
+  $('syUrl').value=st.url||'https://hub.waree.uz';
+  $('syForm').style.display=on?'none':'';$('syMore').style.display=on?'':'none';
+  $('sySt').textContent=on?((st.err?'Ошибка: '+st.err:'Синхронизировано '+agoTxt(st.last))+(st.dirty&&!st.err?' · ждёт отправки':'')):(st.err||'Выключена. Ключ создаётся в центре: Настройки → Ключи синхронизации.');
+}
+$('syGo').addEventListener('click',async()=>{
+  const key=$('syKey').value.trim();if(!/^hub_/.test(key)){toast('Вставь ключ из центра');return}
+  $('syGo').disabled=true;
+  try{
+    const remote=await SY.connect($('syUrl').value.trim(),key);$('syKey').value='';
+    const fresh=!load('m.data',null);
+    if(remote&&remote.data&&fresh){await SY.pull();toast('Данные загружены с сервера')}
+    else if(remote&&remote.data){$('syChoice').style.display='';$('syChoiceTxt').textContent='На сервере уже есть данные от '+new Date(remote.updated).toLocaleString('ru-RU')+'. Что оставить?'}
+    else{await SY.push();toast('Подключено')}
+  }catch(e){toast(e.message)}
+  $('syGo').disabled=false;renderSync();
+});
+$('syTake').addEventListener('click',async()=>{try{await SY.pull();toast('Взято с сервера')}catch(e){toast(e.message)}$('syChoice').style.display='none';renderSync()});
+$('syGive').addEventListener('click',async()=>{await SY.push();$('syChoice').style.display='none';toast('Отправлено');renderSync()});
+$('syNow').addEventListener('click',async()=>{await SY.push();const st=SY.state();toast(st.err?st.err:'Синхронизировано')});
+let pullArm=0;
+$('syPull').addEventListener('click',async()=>{
+  if(Date.now()-pullArm>3000){pullArm=Date.now();$('syPull').textContent='Заменить данные на телефоне?';setTimeout(()=>$('syPull').textContent='Загрузить с сервера',3000);return}
+  pullArm=0;$('syPull').textContent='Загрузить с сервера';
+  try{await SY.pull();toast('Данные заменены данными с сервера')}catch(e){toast(e.message)}
+});
+$('syOff').addEventListener('click',()=>{SY.disable();toast('Синхронизация выключена')});
+window.addEventListener('online',()=>SY.resume());
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')SY.resume()});
+
 window.onBack=()=>{if($('sheet').classList.contains('on')){closeEdit();return true}if(editing){editing=false;renderGrid();return true}if(cur!=='grid'){go('grid');return true}if(sel>=0){sel=-1;renderGrid();return true}return false};
 
-renderAll();
+renderAll();renderSync();SY.resume();
 }
 </script>
 </body>
